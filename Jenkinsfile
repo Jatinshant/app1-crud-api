@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         APP_NAME    = 'app1-api'
-        DEPLOY_BASE = '/home/ubuntu/app1-deploy'
+        DEPLOY_BASE = '/opt/app1-deploy'
         RELEASE_DIR = "${DEPLOY_BASE}/releases/${BUILD_NUMBER}"
         HEALTH_URL  = 'http://127.0.0.1:3000/health'
     }
