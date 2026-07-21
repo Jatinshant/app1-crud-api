@@ -289,3 +289,4 @@ sh: 1: jest: not found
 
 - Rollback was deliberately tested (not just written): a broken deploy was pushed on purpose to confirm the pipeline correctly detects the failed health check, finds the previous release, and restores it via PM2 — rather than assuming the logic was correct from reading it alone.
 - This README will be extended with the remaining infrastructure documentation (architecture overview, Nginx setup, port list, database strategy, IAM scoping, and the Logic & Reasoning Challenge answers) once all infrastructure components are complete, per the overall task's deliverables.
+
