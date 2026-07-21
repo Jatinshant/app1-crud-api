@@ -6,6 +6,14 @@ const healthRoutes = require('./routes/health.routes');
 const app = express();
 app.use(express.json());
 
+// Root endpoint
+app.get('/', (req, res) => {
+  return res.status(200).json({
+    status: 'running',
+    health_check: '/health'
+  });
+});
+
 app.use('/items', itemsRoutes);
 app.use('/', healthRoutes);
 
@@ -13,5 +21,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`App 1 running on port ${PORT}`);
 });
-// pipeline test
-// pipeline testing
