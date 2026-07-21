@@ -1,15 +1,12 @@
 pipeline {
     agent any
-
     environment {
         APP_NAME    = 'app1-api'
         DEPLOY_BASE = '/opt/app1-deploy'
         RELEASE_DIR = "${DEPLOY_BASE}/releases/${BUILD_NUMBER}"
         HEALTH_URL  = 'http://127.0.0.1:3000/health'
     }
-
     stages {
-
         stage('Build') {
             steps {
                 sh '''
@@ -17,12 +14,11 @@ pipeline {
                     cp -r . "$RELEASE_DIR"
                     cd "$RELEASE_DIR"
                     rm -rf node_modules
-                    npm install --production
+                    npm install
                     npx prisma generate
                 '''
             }
         }
-
         stage('Test') {
             steps {
                 sh '''
@@ -31,23 +27,21 @@ pipeline {
                 '''
             }
         }
-
         stage('Deploy') {
             steps {
                 sh '''
-                    ln -sf "$DEPLOY_BASE/shared/.env" "$RELEASE_DIR/.env"
                     cd "$RELEASE_DIR"
+                    npm prune --production
+                    ln -sf "$DEPLOY_BASE/shared/.env" "$RELEASE_DIR/.env"
                     npx prisma migrate deploy
-
                     ln -sfn "$RELEASE_DIR" "$DEPLOY_BASE/current"
-                    pm2 describe $APP_NAME > /dev/null 2>&1 \
-                      && pm2 reload $APP_NAME --update-env \
-                      || pm2 start "$DEPLOY_BASE/current/src/index.js" --name $APP_NAME
-                    pm2 save
+                    sudo -H -u ubuntu pm2 describe $APP_NAME > /dev/null 2>&1 \
+                      && sudo -H -u ubuntu pm2 reload $APP_NAME --update-env \
+                      || sudo -H -u ubuntu pm2 start "$DEPLOY_BASE/current/src/index.js" --name $APP_NAME
+                    sudo -H -u ubuntu pm2 save
                 '''
             }
         }
-
         stage('Health Check') {
             steps {
                 script {
@@ -70,7 +64,6 @@ pipeline {
             }
         }
     }
-
     post {
         failure {
             script {
@@ -79,7 +72,7 @@ pipeline {
                     PREV_RELEASE=$(ls -1dt $DEPLOY_BASE/releases/*/ | sed -n '2p')
                     if [ -n "$PREV_RELEASE" ]; then
                         ln -sfn "$PREV_RELEASE" "$DEPLOY_BASE/current"
-                        pm2 reload $APP_NAME --update-env
+                        sudo -H -u ubuntu pm2 reload $APP_NAME --update-env
                         echo "Rolled back to: $PREV_RELEASE"
                     else
                         echo "No previous release available — cannot roll back"
