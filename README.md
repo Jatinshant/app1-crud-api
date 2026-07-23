@@ -2,6 +2,27 @@
 
 A simple CRUD API built with **Node.js, Express, and Prisma ORM**, connected to a **PostgreSQL** database (hosted on AWS RDS). This application was built as part of a DevOps Engineer technical assessment — the business logic is intentionally simple, as the focus of the task is the infrastructure and deployment pipeline around it, not the application itself.
 
+This README also documents the **overall infrastructure** for the assessment (both Application 1 and Application 2 / Multi-Auth — [github.com/Jatinshant/Multi-Auth](https://github.com/Jatinshant/Multi-Auth)), since they share the same server, RDS instance, reverse proxy, and CI/CD system.
+
+---
+
+## Table of Contents
+
+1. [Tech Stack](#tech-stack)
+2. [Endpoints](#endpoints)
+3. [Infrastructure Setup From Scratch (VPC → Both Apps Live)](#infrastructure-setup-from-scratch-vpc--both-apps-live)
+4. [Running This App Standalone](#running-this-app-standalone)
+5. [Environment Variables](#environment-variables)
+6. [Infrastructure Architecture](#infrastructure-architecture)
+7. [Nginx Reverse Proxy Setup](#nginx-reverse-proxy-setup)
+8. [Port List & Justification](#port-list--justification)
+9. [Database Strategy](#database-strategy)
+10. [Instance Sizing Rationale](#instance-sizing-rationale)
+11. [CI/CD Pipeline (Jenkins)](#cicd-pipeline-jenkins)
+12. [Decision Note — Logic & Reasoning Challenges](#decision-note--logic--reasoning-challenges)
+13. [Issues Faced During Setup](#issues-faced-during-setup-and-how-they-were-resolved)
+14. [Notes](#notes)
+
 ---
 
 ## Tech Stack
@@ -11,6 +32,7 @@ A simple CRUD API built with **Node.js, Express, and Prisma ORM**, connected to 
 - **PostgreSQL** — database engine, hosted on AWS RDS
 - **PM2** — process manager on the deployment server
 - **Jenkins** — CI/CD (Pipeline-as-Code via the `Jenkinsfile` in this repo)
+- **Nginx** — reverse proxy, TLS termination
 
 This stack was chosen deliberately to match Application 2 (Multi-Auth), which also uses Node.js + Express + Prisma + PostgreSQL. Keeping both applications on the same runtime and ORM reduces operational complexity on the shared server (one Node.js version to manage, one migration pattern, similar pipeline structure across both apps) rather than for any strict technical necessity.
 
@@ -42,9 +64,160 @@ Note: the health check uses one raw query (`SELECT 1`) purely to test database c
 
 ---
 
-## Setup From Scratch
+## Infrastructure Setup From Scratch (VPC → Both Apps Live)
 
-These steps take a fresh clone of this repo to a running instance, whether locally or on a server.
+This section is a sequential runbook — following it in order takes an empty AWS account to both applications running live, exactly as deployed for this assessment. Each step links back to the fuller explanation elsewhere in this README rather than repeating it.
+
+### 1. AWS account & IAM prerequisites
+- Create/use an AWS account, enable MFA on the root user, and do not use root for day-to-day work.
+- Create a personal IAM admin user for actually building this infrastructure (separate from the scoped read-only reviewer user created in step 19).
+
+### 2. VPC & networking
+- Create a custom VPC (`10.0.0.0/16` or similar) with **one public subnet** and **two private subnets in two different Availability Zones**.
+- Two AZs are required even though only one AZ is actually used by the RDS instance — AWS enforces a minimum 2-AZ coverage requirement on any DB subnet group, regardless of whether Multi-AZ deployment is enabled.
+- Confirm the public subnet's route table has a route to an Internet Gateway; confirm the private subnets' route tables do not.
+
+### 3. Security groups
+- `app-server-sg`: inbound 22 (SSH) from your IP only, 80 and 443 from `0.0.0.0/0`.
+- `rds-db-sg`: inbound 5432 from `app-server-sg` only (referenced by security group ID, not by IP).
+- See [Port List & Justification](#port-list--justification) for the full, final rule set.
+
+### 4. EC2 instance
+- Launch one instance (`t3.micro`, Ubuntu) into the **public** subnet, attached to `app-server-sg`.
+- Allocate and associate an **Elastic IP** — without this, the instance's public IP changes on stop/restart, breaking the DNS records created in step 9.
+
+### 5. RDS instance
+- Create a DB subnet group spanning both private subnets (both AZs).
+- Provision one PostgreSQL instance (`db.t4g.micro`), Public Access = **No**, attached to `rds-db-sg`.
+- Connect via `psql` and create two databases with separate users/credentials: `app1_db` and the Multi-Auth service's database (e.g. `auth_service`).
+- See [Database Strategy](#database-strategy) for the full reasoning behind one instance vs. two.
+
+### 6. Baseline server tooling
+On the EC2 instance:
+```bash
+sudo apt update && sudo apt upgrade -y
+# Docker (official repo)
+# Node.js LTS (NodeSource)
+sudo npm install -g pm2
+sudo apt install -y nginx
+```
+
+### 7. Clone and configure Application 1 (this repo)
+```bash
+git clone https://github.com/Jatinshant/app1-crud-api.git
+cd app1-crud-api
+cp .env.example .env   # fill in real DATABASE_URL pointing at app1_db
+npm install
+npx prisma generate
+npx prisma migrate deploy
+pm2 start src/index.js --name app1-api
+curl http://localhost:3000/health
+```
+
+### 8. Clone and configure Application 2 (Multi-Auth)
+Repo: **[github.com/Jatinshant/Multi-Auth](https://github.com/Jatinshant/Multi-Auth)** (fork it first so you have push access for the `Jenkinsfile` added in step 16).
+```bash
+git clone git@github.com:<your-username>/Multi-Auth.git
+cd Multi-Auth
+npm install
+npm run setup-keys            # generates fresh RSA keys under keys/
+cp .env.example .env          # fill in DATABASE_URL (pointing at the auth database),
+                               # JWT_PRIVATE_KEY / JWT_PUBLIC_KEY from keys/*_env.txt,
+                               # NODE_ENV=production, real client secrets
+npx prisma generate
+npx prisma migrate deploy
+npm run seed:clients
+pm2 start server.js --name auth-service
+curl http://localhost:5000/
+```
+
+### 9. DNS
+Add three `A` records at your DNS provider, all pointing to the EC2 Elastic IP:
+```
+app1.jatintech.online
+auth.jatintech.online
+jenkins.jatintech.online
+```
+
+### 10. Nginx — reverse proxy
+- Write the three server blocks exactly as shown in [Nginx Reverse Proxy Setup](#nginx-reverse-proxy-setup) into `/etc/nginx/sites-available/`, symlink into `sites-enabled/`, remove the default site.
+- `sudo nginx -t && sudo systemctl reload nginx` (or `start`/`enable` if not yet running).
+
+### 11. SSL via Certbot
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d app1.jatintech.online
+sudo certbot --nginx -d auth.jatintech.online
+sudo certbot --nginx -d jenkins.jatintech.online
+```
+Certbot rewrites each server block in place to add the `443 ssl` block and the HTTP→HTTPS redirect shown in the Nginx section.
+
+### 12. Install Jenkins
+```bash
+sudo apt install -y fontconfig openjdk-17-jre
+sudo mkdir -p /etc/apt/keyrings
+wget -q -O - https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo gpg --dearmor -o /etc/apt/keyrings/jenkins-keyring.asc
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee /etc/apt/sources.list.d/jenkins.list
+sudo apt update && sudo apt install -y jenkins
+```
+Piping the key through `gpg --dearmor` (rather than saving it as raw ASCII text) is required — see [Issues Faced](#issues-faced-during-setup-and-how-they-were-resolved) #7.
+
+### 13. Set Jenkins to a non-default port
+```bash
+sudo systemctl edit jenkins
+```
+```ini
+[Service]
+Environment="JENKINS_PORT=8081"
+```
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart jenkins
+```
+
+### 14. Jenkins ↔ Nginx
+Already covered by step 10/11 (`jenkins.jatintech.online` block). Confirm `proxy_pass` points at the port actually set in step 13.
+
+### 15. Jenkins initial setup & plugins
+- Get the initial password: `sudo cat /var/lib/jenkins/secrets/initialAdminPassword`.
+- Install suggested plugins, plus **GitHub plugin** and **Role-based Authorization Strategy**.
+- Create your own Jenkins admin user.
+
+### 16. Cross-user permissions (required before either pipeline can deploy)
+Jenkins runs as the `jenkins` system user; the apps run under PM2 as `ubuntu`. Both need write access to their respective deploy directories, and Jenkins needs a scoped way to control PM2:
+```bash
+sudo groupadd deploy
+sudo usermod -aG deploy jenkins
+sudo usermod -aG deploy ubuntu
+sudo mkdir -p /opt/app1-deploy/releases /opt/app1-deploy/shared
+sudo mkdir -p /opt/auth-service-deploy/releases /opt/auth-service-deploy/shared
+sudo chown -R jenkins:deploy /opt/app1-deploy /opt/auth-service-deploy
+sudo chmod -R 2775 /opt/app1-deploy /opt/auth-service-deploy
+echo "jenkins ALL=(ubuntu) NOPASSWD: /usr/bin/pm2" | sudo tee /etc/sudoers.d/jenkins-pm2
+```
+Place each app's real production `.env` at `/opt/app1-deploy/shared/.env` and `/opt/auth-service-deploy/shared/.env` respectively — outside git, symlinked into every release. See [Issues Faced](#issues-faced-during-setup-and-how-they-were-resolved) #4 and #8 for why this exact structure was needed.
+
+### 17. Create both Jenkins pipeline jobs
+For each repo (App 1, and your Multi-Auth fork):
+- New Item → Pipeline → Build Triggers: "GitHub hook trigger for GITScm polling" → Pipeline: "Pipeline script from SCM" → Git → repo URL → Script Path: `Jenkinsfile`.
+- On GitHub: repo → Settings → Webhooks → Payload URL `https://jenkins.jatintech.online/github-webhook/`, content type `application/json`, "Just the push event."
+
+### 18. Verify end-to-end, including a deliberate rollback test
+- Push a trivial commit to each repo, confirm the pipeline runs Build → Test/Migrate → Deploy → Health Check automatically.
+- Deliberately break the health check once per app, push, confirm the pipeline fails and the `post { failure { ... } }` block rolls the `current` symlink back to the previous release, then revert the deliberate break.
+
+### 19. Jenkins reviewer account (read-only)
+Manage Jenkins → Security → Role-Based Strategy → create a role with only `Overall/Read`, `Job/Read`, `Job/Workspace` → create a `reviewer` user → assign the role.
+
+### 20. AWS IAM reviewer account (scoped read-only)
+Create a custom policy (not the broad `ReadOnlyAccess`) with only `ec2:Describe*`, `rds:Describe*`, and `logs:Describe*`/`Get*`/`Filter*` actions, attach it to a new `task-reviewer` IAM user, generate an access key. See [Decision Note, Q6](#decision-note--logic--reasoning-challenges) for the full reasoning.
+
+> Reviewer credentials (Jenkins login, IAM access key/secret) are never placed in this repository — they are sent only via the submission email, per the Credential Handling requirement.
+
+---
+
+## Running This App Standalone
+
+If you just want to run **this app** (Application 1) on its own — locally, or on any server — without the rest of the infrastructure above:
 
 1. Clone the repository:
    ```bash
@@ -64,14 +237,8 @@ These steps take a fresh clone of this repo to a running instance, whether local
    npx prisma generate
    ```
 5. Apply database migrations:
-   - First-time / local development:
-     ```bash
-     npx prisma migrate dev --name init
-     ```
-   - Production / subsequent deploys (used by the Jenkins pipeline):
-     ```bash
-     npx prisma migrate deploy
-     ```
+   - First-time / local development: `npx prisma migrate dev --name init`
+   - Production / subsequent deploys (used by the Jenkins pipeline): `npx prisma migrate deploy`
 6. Start the app:
    ```bash
    npm run dev     # development, with auto-reload
@@ -90,198 +257,6 @@ PORT=3000
 ```
 
 No real credentials are committed anywhere in this repository or its commit history.
-
----
-
-## CI/CD Pipeline (Jenkins)
-
-The `Jenkinsfile` in this repo defines a fully automated pipeline, triggered on push via a GitHub webhook. No manual steps are required on the server after a push.
-
-### Stages
-
-1. **Check Changes** — inspects the files changed in the latest commit. If the only file changed is `README.md`, the remaining stages are skipped entirely (build, test, deploy, and health check do not run, and no rollback logic fires). This avoids unnecessary redeploys for documentation-only changes.
-2. **Build** — copies the repo into a new versioned release folder, installs dependencies, and generates the Prisma client.
-3. **Test** — runs the test suite (`npm test`) against the newly built release.
-4. **Deploy** — prunes dev dependencies, links the shared production `.env`, runs `npx prisma migrate deploy`, atomically points a `current` symlink at the new release, and reloads the app under PM2.
-5. **Health Check** — polls `/health` up to 3 times (5s timeout per attempt, 3s between attempts). Any non-`200` response after all attempts is treated as a failed deploy.
-
-### Release & rollback strategy
-
-Each deploy is written to its own folder under `/opt/app1-deploy/releases/<build-number>/`, and a `current` symlink points to whichever release is live. This means:
-
-- Rolling back is just re-pointing the `current` symlink to the previous release folder and reloading PM2 — no rebuild needed, so rollback is fast and doesn't depend on the failing build's state.
-- Old releases stay on disk, so rollback always has a known-good target as long as at least one prior successful deploy exists.
-
-**Why `/opt` instead of a user's home directory:** Jenkins runs as its own dedicated system user (`jenkins`), not as `ubuntu`. A user's home directory (`/home/ubuntu`) is `700` by default and isn't traversable by other users — deploying there would require loosening permissions on the entire home directory, which is unnecessary exposure. `/opt` is a standard, world-traversable location for third-party application data, so the deploy target folder can be owned and managed by the `jenkins` user in isolation.
-
-**Rollback trigger definition:** A deploy is considered failed, and rollback is triggered, only if `/health` does not return HTTP `200` after 3 attempts (5s request timeout, 3s wait between attempts, ~24s total window). This threshold was chosen to tolerate brief PM2 reload/restart latency without either rolling back too eagerly or waiting so long that a genuinely broken deploy stays live.
-
-### Running Jenkins as a different user than the app (PM2 cross-user access)
-
-The app runs under PM2 as the `ubuntu` user (its original setup), while Jenkins runs as its own `jenkins` system user with its own separate PM2 daemon. Rather than running the Jenkins agent itself as `ubuntu` (which would grant Jenkins broad access to that user's entire environment), a narrowly scoped passwordless `sudo` rule was added so the `jenkins` user can invoke only the `pm2` binary, and only as `ubuntu`:
-
-```
-jenkins ALL=(ubuntu) NOPASSWD: /usr/bin/pm2
-```
-
-This keeps the pipeline able to deploy and restart the app without granting Jenkins any wider access to the `ubuntu` account.
-
-### Secrets across stages
-
-- **Build time:** no secrets are present. The build stage only installs dependencies and generates the Prisma client.
-- **Deploy time:** the production `.env` file lives once, outside git and outside any release folder, at `/opt/app1-deploy/shared/.env`. Each release symlinks this file in (`ln -sf`) rather than copying it — so secrets are never duplicated into a release folder or committed to git history.
-- **Runtime:** the app reads `.env` via `dotenv` at process start, the same way in every environment (local, server, CI).
-- **What's committed:** only `.env.example` (placeholder keys, no real values) is committed to this repo. Real `DATABASE_URL` values, database passwords, and any other secrets never appear in a commit, a build log, or a Jenkinsfile.
-
----
-
-## Issues Faced During Setup (and how they were resolved)
-
-Documenting these honestly, since they reflect real debugging done during development rather than a frictionless build.
-
-### 1. Prisma 7 breaking change — `url` no longer supported in `schema.prisma`
-
-**Error encountered:**
-```
-Error: Prisma schema validation - (get-config wasm)
-Error code: P1012
-error: The datasource property `url` is no longer supported in schema files.
-Move connection URLs for Migrate to `prisma.config.ts` and pass either `adapter`
-for a direct database connection or `accelerateUrl` for Accelerate to the
-`PrismaClient` constructor.
-```
-
-**Cause:** The installed Prisma version (7.x) changed how database connection URLs are configured. Previously, `datasource db { url = env("DATABASE_URL") }` inside `schema.prisma` was standard — in Prisma 7, this responsibility moved to `prisma.config.ts` for the CLI/migrations, and `PrismaClient` itself now requires an explicit **driver adapter** to connect at runtime.
-
-**Fix applied:**
-- Removed the `url = env("DATABASE_URL")` line from `schema.prisma`, leaving only:
-  ```prisma
-  datasource db {
-    provider = "postgresql"
-  }
-  ```
-- Confirmed `prisma.config.ts` (auto-generated by `npx prisma init`) correctly reads the connection string:
-  ```typescript
-  import "dotenv/config";
-  import { defineConfig } from "prisma/config";
-  export default defineConfig({
-    schema: "prisma/schema.prisma",
-    migrations: { path: "prisma/migrations" },
-    datasource: { url: process.env["DATABASE_URL"] },
-  });
-  ```
-- Installed the PostgreSQL driver adapter:
-  ```bash
-  npm install @prisma/adapter-pg
-  ```
-- Updated `src/config/prisma.js` to construct `PrismaClient` with the adapter explicitly:
-  ```javascript
-  const { PrismaClient } = require('@prisma/client');
-  const { PrismaPg } = require('@prisma/adapter-pg');
-
-  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
-  const prisma = new PrismaClient({ adapter });
-
-  module.exports = prisma;
-  ```
-
-This brought the setup in line with Prisma 7's architecture and resolved the validation error.
-
-### 2. Database authentication failure — wrong master username
-
-**Error encountered:**
-```
-Error: P1000: Authentication failed against database server, the provided
-database credentials for `admin` are not valid.
-```
-
-**Cause:** The `.env` file's `DATABASE_URL` used `admin` as the database username, which did not match the actual RDS master username configured for the instance (`postgres`). Additionally, the target database (`app1_db`) had not yet been created on the RDS instance — only the default `postgres` database existed at that point.
-
-**Fix applied:**
-- Corrected the username in `DATABASE_URL` from `admin` to `postgres` (matching the actual RDS master username).
-- Connected to the RDS instance manually via `psql` and created the missing database:
-  ```sql
-  CREATE DATABASE app1_db;
-  ```
-- Re-ran the migration, which then succeeded:
-  ```bash
-  npx prisma migrate dev --name init
-  ```
-
-**Takeaway noted for the pipeline:** database credentials and database existence should be verified as part of environment setup before any deploy — a mismatch here fails loudly and early (good), but it's worth double-checking `.env` values against the actual RDS configuration rather than assuming.
-
-### 3. `MODULE_NOT_FOUND` — `.prisma/client/default`
-
-**Error encountered:**
-```
-Error: Cannot find module '.prisma/client/default'
-```
-
-**Cause:** `@prisma/client` does not ship pre-generated — the actual client code (matching the current schema) must be generated via `npx prisma generate`. After installing `@prisma/adapter-pg` and updating `node_modules`, the generated client was out of date/missing.
-
-**Fix applied:**
-```bash
-npx prisma generate
-```
-
-**Takeaway noted for the pipeline:** the Jenkins build stage must always run `npx prisma generate` immediately after `npm install`, every single deploy — not just once — otherwise a fresh install on a clean environment (like a CI runner or a redeployed container) will crash with this same error.
-
-### 4. Jenkins build stage — `Permission denied` writing to the deploy directory
-
-**Error encountered:**
-```
-+ mkdir -p /home/ubuntu/app1-deploy/releases/1
-mkdir: Permission denied
-```
-
-**Cause:** Jenkins runs its build steps as the `jenkins` system user, not as `ubuntu`. `/home/ubuntu` is `700` by default (owned by, and only traversable by, `ubuntu`), so `jenkins` had no way to create anything inside it — even after the target subfolder itself was chowned, the parent directory still blocked entry.
-
-**Fix applied:**
-- Moved the deploy target out of any user's home directory entirely, to `/opt/app1-deploy`:
-  ```bash
-  sudo mkdir -p /opt/app1-deploy/releases
-  sudo chown -R jenkins:jenkins /opt/app1-deploy
-  ```
-- Updated every path reference in the `Jenkinsfile` from `/home/ubuntu/app1-deploy` to `/opt/app1-deploy`.
-
-**Takeaway noted for the pipeline:** deploy targets should live in a location the CI system's own user can own outright (`/opt`, `/srv`, etc.), rather than inside another user's home directory — this avoids having to loosen permissions on a directory that holds unrelated personal files.
-
-### 5. Test stage failure — `jest: not found`
-
-**Error encountered:**
-```
-> npm test
-> jest --detectOpenHandles --forceExit
-sh: 1: jest: not found
-```
-
-**Cause:** The Build stage ran `npm install --production`, which skips everything in `devDependencies` — and `jest` (the test runner) lives there. So by the time the Test stage ran, `jest` was never installed in the first place.
-
-**Fix applied:**
-- Changed the Build stage to run a full `npm install` (no `--production` flag), so dev tooling like `jest` is present for the Test stage.
-- Moved dependency pruning to the Deploy stage instead, running `npm prune --production` only after tests have already passed — so the final deployed release still ends up free of dev-only packages, without breaking the Test stage.
-
-**Takeaway noted for the pipeline:** `--production`/`--omit=dev` installs should only happen after everything that needs `devDependencies` (tests, build tooling) has already run — pruning is a post-test step, not a pre-test one.
-
-### 6. PM2 deploy failure — `Process or Namespace app1-api not found`
-
-**Error encountered:**
-```
-[PM2] Spawning PM2 daemon with pm2_home=/var/lib/jenkins/.pm2
-[PM2][ERROR] Process or Namespace app1-api not found
-```
-
-**Cause:** PM2 keeps a separate daemon and process list per system user (`~/.pm2`). The app was originally started under the `ubuntu` user's PM2 daemon, but Jenkins runs pipeline steps as the `jenkins` user — so from Jenkins' perspective, a completely separate (and empty) PM2 world existed, one that had never heard of `app1-api`.
-
-**Fix applied:**
-- Added a narrowly scoped passwordless `sudo` rule allowing the `jenkins` user to run only the `pm2` binary, and only as `ubuntu`:
-  ```
-  jenkins ALL=(ubuntu) NOPASSWD: /usr/bin/pm2
-  ```
-- Updated every PM2 command in the `Jenkinsfile` to run via `sudo -H -u ubuntu pm2 ...`, so Jenkins manages the correct, existing PM2 process instead of spinning up a second, unrelated one.
-- Removed the stray PM2 daemon Jenkins had created under its own user (`sudo -u jenkins pm2 kill`, then deleted `/var/lib/jenkins/.pm2`).
-
-**Takeaway noted for the pipeline:** when CI runs as a dedicated system user, it's worth checking early whether the actual deploy target (process manager, service, etc.) is scoped to a *different* user — otherwise CI can appear to "succeed" at commands that are silently operating on the wrong, empty state.
 
 ---
 
@@ -471,6 +446,48 @@ A single AWS RDS PostgreSQL instance (`db.t4g.micro`) hosts two separate databas
 
 ---
 
+## CI/CD Pipeline (Jenkins)
+
+The `Jenkinsfile` in this repo defines a fully automated pipeline, triggered on push via a GitHub webhook. No manual steps are required on the server after a push.
+
+### Stages
+
+1. **Check Changes** — inspects the files changed in the latest commit. If the only file changed is `README.md`, the remaining stages are skipped entirely (build, test, deploy, and health check do not run, and no rollback logic fires). This avoids unnecessary redeploys for documentation-only changes.
+2. **Build** — copies the repo into a new versioned release folder, installs dependencies, and generates the Prisma client.
+3. **Test** — runs the test suite (`npm test`) against the newly built release.
+4. **Deploy** — prunes dev dependencies, links the shared production `.env`, runs `npx prisma migrate deploy`, atomically points a `current` symlink at the new release, and reloads the app under PM2.
+5. **Health Check** — polls `/health` up to 3 times (5s timeout per attempt, 3s between attempts). Any non-`200` response after all attempts is treated as a failed deploy.
+
+### Release & rollback strategy
+
+Each deploy is written to its own folder under `/opt/app1-deploy/releases/<build-number>/`, and a `current` symlink points to whichever release is live. This means:
+
+- Rolling back is just re-pointing the `current` symlink to the previous release folder and reloading PM2 — no rebuild needed, so rollback is fast and doesn't depend on the failing build's state.
+- Old releases stay on disk, so rollback always has a known-good target as long as at least one prior successful deploy exists.
+
+**Why `/opt` instead of a user's home directory:** Jenkins runs as its own dedicated system user (`jenkins`), not as `ubuntu`. A user's home directory (`/home/ubuntu`) is `700` by default and isn't traversable by other users — deploying there would require loosening permissions on the entire home directory, which is unnecessary exposure. `/opt` is a standard, world-traversable location for third-party application data, so the deploy target folder can be owned and managed by the `jenkins` user in isolation.
+
+**Rollback trigger definition:** A deploy is considered failed, and rollback is triggered, only if `/health` does not return HTTP `200` after 3 attempts (5s request timeout, 3s wait between attempts, ~24s total window). This threshold was chosen to tolerate brief PM2 reload/restart latency without either rolling back too eagerly or waiting so long that a genuinely broken deploy stays live.
+
+### Running Jenkins as a different user than the app (PM2 cross-user access)
+
+The app runs under PM2 as the `ubuntu` user (its original setup), while Jenkins runs as its own `jenkins` system user with its own separate PM2 daemon. Rather than running the Jenkins agent itself as `ubuntu` (which would grant Jenkins broad access to that user's entire environment), a narrowly scoped passwordless `sudo` rule was added so the `jenkins` user can invoke only the `pm2` binary, and only as `ubuntu`:
+
+```
+jenkins ALL=(ubuntu) NOPASSWD: /usr/bin/pm2
+```
+
+This keeps the pipeline able to deploy and restart the app without granting Jenkins any wider access to the `ubuntu` account.
+
+### Secrets across stages
+
+- **Build time:** no secrets are present. The build stage only installs dependencies and generates the Prisma client.
+- **Deploy time:** the production `.env` file lives once, outside git and outside any release folder, at `/opt/app1-deploy/shared/.env`. Each release symlinks this file in (`ln -sf`) rather than copying it — so secrets are never duplicated into a release folder or committed to git history.
+- **Runtime:** the app reads `.env` via `dotenv` at process start, the same way in every environment (local, server, CI).
+- **What's committed:** only `.env.example` (placeholder keys, no real values) is committed to this repo. Real `DATABASE_URL` values, database passwords, and any other secrets never appear in a commit, a build log, or a Jenkinsfile.
+
+---
+
 ## Decision Note — Logic & Reasoning Challenges
 
 **1. Reverse Proxy Design.** Nginx routes purely on the `Host` header of each incoming request — each subdomain has its own `server` block with a matching `server_name`, so Nginx dispatches to whichever block matches. All three services (App1, Multi-Auth, Jenkins) are bound to `127.0.0.1` on their own ports and are reachable only through their respective `server_name` block, not directly. The default Nginx site was removed so unmatched `Host` headers get no response at all, rather than silently hitting an arbitrary app.
@@ -492,7 +509,180 @@ No action in this policy can create, modify, or delete any resource — every pe
 
 ---
 
+## Issues Faced During Setup (and how they were resolved)
+
+Documenting these honestly, since they reflect real debugging done during development rather than a frictionless build.
+
+### 1. Prisma 7 breaking change — `url` no longer supported in `schema.prisma`
+
+**Error encountered:**
+```
+Error: Prisma schema validation - (get-config wasm)
+Error code: P1012
+error: The datasource property `url` is no longer supported in schema files.
+Move connection URLs for Migrate to `prisma.config.ts` and pass either `adapter`
+for a direct database connection or `accelerateUrl` for Accelerate to the
+`PrismaClient` constructor.
+```
+
+**Cause:** The installed Prisma version (7.x) changed how database connection URLs are configured. Previously, `datasource db { url = env("DATABASE_URL") }` inside `schema.prisma` was standard — in Prisma 7, this responsibility moved to `prisma.config.ts` for the CLI/migrations, and `PrismaClient` itself now requires an explicit **driver adapter** to connect at runtime.
+
+**Fix applied:**
+- Removed the `url = env("DATABASE_URL")` line from `schema.prisma`, leaving only:
+  ```prisma
+  datasource db {
+    provider = "postgresql"
+  }
+  ```
+- Confirmed `prisma.config.ts` (auto-generated by `npx prisma init`) correctly reads the connection string:
+  ```typescript
+  import "dotenv/config";
+  import { defineConfig } from "prisma/config";
+  export default defineConfig({
+    schema: "prisma/schema.prisma",
+    migrations: { path: "prisma/migrations" },
+    datasource: { url: process.env["DATABASE_URL"] },
+  });
+  ```
+- Installed the PostgreSQL driver adapter:
+  ```bash
+  npm install @prisma/adapter-pg
+  ```
+- Updated `src/config/prisma.js` to construct `PrismaClient` with the adapter explicitly:
+  ```javascript
+  const { PrismaClient } = require('@prisma/client');
+  const { PrismaPg } = require('@prisma/adapter-pg');
+
+  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+  const prisma = new PrismaClient({ adapter });
+
+  module.exports = prisma;
+  ```
+
+This brought the setup in line with Prisma 7's architecture and resolved the validation error.
+
+### 2. Database authentication failure — wrong master username
+
+**Error encountered:**
+```
+Error: P1000: Authentication failed against database server, the provided
+database credentials for `admin` are not valid.
+```
+
+**Cause:** The `.env` file's `DATABASE_URL` used `admin` as the database username, which did not match the actual RDS master username configured for the instance (`postgres`). Additionally, the target database (`app1_db`) had not yet been created on the RDS instance — only the default `postgres` database existed at that point.
+
+**Fix applied:**
+- Corrected the username in `DATABASE_URL` from `admin` to `postgres` (matching the actual RDS master username).
+- Connected to the RDS instance manually via `psql` and created the missing database:
+  ```sql
+  CREATE DATABASE app1_db;
+  ```
+- Re-ran the migration, which then succeeded:
+  ```bash
+  npx prisma migrate dev --name init
+  ```
+
+**Takeaway noted for the pipeline:** database credentials and database existence should be verified as part of environment setup before any deploy — a mismatch here fails loudly and early (good), but it's worth double-checking `.env` values against the actual RDS configuration rather than assuming.
+
+### 3. `MODULE_NOT_FOUND` — `.prisma/client/default`
+
+**Error encountered:**
+```
+Error: Cannot find module '.prisma/client/default'
+```
+
+**Cause:** `@prisma/client` does not ship pre-generated — the actual client code (matching the current schema) must be generated via `npx prisma generate`. After installing `@prisma/adapter-pg` and updating `node_modules`, the generated client was out of date/missing.
+
+**Fix applied:**
+```bash
+npx prisma generate
+```
+
+**Takeaway noted for the pipeline:** the Jenkins build stage must always run `npx prisma generate` immediately after `npm install`, every single deploy — not just once — otherwise a fresh install on a clean environment (like a CI runner or a redeployed container) will crash with this same error.
+
+### 4. Jenkins build stage — `Permission denied` writing to the deploy directory
+
+**Error encountered:**
+```
++ mkdir -p /home/ubuntu/app1-deploy/releases/1
+mkdir: Permission denied
+```
+
+**Cause:** Jenkins runs its build steps as the `jenkins` system user, not as `ubuntu`. `/home/ubuntu` is `700` by default (owned by, and only traversable by, `ubuntu`), so `jenkins` had no way to create anything inside it — even after the target subfolder itself was chowned, the parent directory still blocked entry.
+
+**Fix applied:**
+- Moved the deploy target out of any user's home directory entirely, to `/opt/app1-deploy`:
+  ```bash
+  sudo mkdir -p /opt/app1-deploy/releases
+  sudo chown -R jenkins:jenkins /opt/app1-deploy
+  ```
+- Updated every path reference in the `Jenkinsfile` from `/home/ubuntu/app1-deploy` to `/opt/app1-deploy`.
+
+**Takeaway noted for the pipeline:** deploy targets should live in a location the CI system's own user can own outright (`/opt`, `/srv`, etc.), rather than inside another user's home directory — this avoids having to loosen permissions on a directory that holds unrelated personal files.
+
+### 5. Test stage failure — `jest: not found`
+
+**Error encountered:**
+```
+> npm test
+> jest --detectOpenHandles --forceExit
+sh: 1: jest: not found
+```
+
+**Cause:** The Build stage ran `npm install --production`, which skips everything in `devDependencies` — and `jest` (the test runner) lives there. So by the time the Test stage ran, `jest` was never installed in the first place.
+
+**Fix applied:**
+- Changed the Build stage to run a full `npm install` (no `--production` flag), so dev tooling like `jest` is present for the Test stage.
+- Moved dependency pruning to the Deploy stage instead, running `npm prune --production` only after tests have already passed — so the final deployed release still ends up free of dev-only packages, without breaking the Test stage.
+
+**Takeaway noted for the pipeline:** `--production`/`--omit=dev` installs should only happen after everything that needs `devDependencies` (tests, build tooling) has already run — pruning is a post-test step, not a pre-test one.
+
+### 6. PM2 deploy failure — `Process or Namespace app1-api not found`
+
+**Error encountered:**
+```
+[PM2] Spawning PM2 daemon with pm2_home=/var/lib/jenkins/.pm2
+[PM2][ERROR] Process or Namespace app1-api not found
+```
+
+**Cause:** PM2 keeps a separate daemon and process list per system user (`~/.pm2`). The app was originally started under the `ubuntu` user's PM2 daemon, but Jenkins runs pipeline steps as the `jenkins` user — so from Jenkins' perspective, a completely separate (and empty) PM2 world existed, one that had never heard of `app1-api`.
+
+**Fix applied:**
+- Added a narrowly scoped passwordless `sudo` rule allowing the `jenkins` user to run only the `pm2` binary, and only as `ubuntu`:
+  ```
+  jenkins ALL=(ubuntu) NOPASSWD: /usr/bin/pm2
+  ```
+- Updated every PM2 command in the `Jenkinsfile` to run via `sudo -H -u ubuntu pm2 ...`, so Jenkins manages the correct, existing PM2 process instead of spinning up a second, unrelated one.
+- Removed the stray PM2 daemon Jenkins had created under its own user (`sudo -u jenkins pm2 kill`, then deleted `/var/lib/jenkins/.pm2`).
+
+**Takeaway noted for the pipeline:** when CI runs as a dedicated system user, it's worth checking early whether the actual deploy target (process manager, service, etc.) is scoped to a *different* user — otherwise CI can appear to "succeed" at commands that are silently operating on the wrong, empty state.
+
+### 7. Nginx — Jenkins reverse proxy `403`/`502` during setup
+
+**Errors encountered (in sequence):** an ASCII-armored (non-dearmored) GPG key causing `NO_PUBKEY` during Jenkins installation; an Nginx reload failure due to a config referencing a since-deleted Let's Encrypt certificate; a `403 Forbidden` when testing from the server itself rather than the actual client IP; and connection-refused from Nginx correctly forwarding to a port Jenkins wasn't actually listening on.
+
+**Fix applied:** re-generated the GPG key using `gpg --dearmor`; rebuilt `jenkins.conf` as a clean HTTP-only server block before re-running Certbot to regenerate the SSL block from scratch; confirmed all reachability testing from the actual local machine rather than via SSH into the server; and aligned the Nginx `proxy_pass` port with Jenkins' actual configured `--httpPort`.
+
+**Takeaway:** when a reverse-proxied service returns unexpected errors, check each layer independently and in order — DNS resolution, the reverse proxy's own access rules, the reverse proxy's upstream connectivity, and finally the backend service itself.
+
+### 8. Jenkins pipeline — cross-user directory permissions (Multi-Auth)
+
+**Error encountered:**
+```
++ mkdir -p /opt/auth-service-deploy/releases/1
+mkdir: Permission denied
+```
+
+**Cause:** The Multi-Auth deploy directory had been created with `chown -R ubuntu:ubuntu`, giving the `jenkins` user (which the pipeline actually runs as) no write access at all.
+
+**Fix applied:** created a shared Linux group (`deploy`), added both `jenkins` and `ubuntu` to it, and set the directory's ownership/permissions to `jenkins:deploy` with mode `2775` — the setgid bit ensures every new release folder Jenkins creates automatically inherits the `deploy` group, so `ubuntu`/PM2 can always read and execute it without manual permission fixes after every deploy.
+
+**Takeaway:** rather than granting one user exclusive ownership (too restrictive) or making a directory world-writable (too permissive), a shared group with the setgid bit gives exactly the two processes that need access the access they need, and nothing more.
+
+---
+
 ## Notes
 
 - Rollback was deliberately tested (not just written) for **both** pipelines: a broken deploy was pushed on purpose to confirm each pipeline correctly detects the failed health check, finds the previous release, and restores it via PM2 — rather than assuming the logic was correct from reading it alone.
+- **Multi-Auth repository scope:** the provided Multi-Auth repository, as given, contains only the Auth Service backend — no React frontend and no separate HRM application, despite its own README describing a fuller multi-service architecture. This was deployed as-is; no frontend build step exists in its pipeline as a result, and its health check uses `/` since the repository does not include a dedicated `/health` route with database connectivity checking.
 - Bonus items attempted: SSL via Let's Encrypt/Certbot on all three subdomains (App1, Multi-Auth, Jenkins), with automatic HTTP→HTTPS redirect. Further Nginx hardening (HSTS, CSP, rate limiting), automated DB backups with a tested restore process, and a local-dev Docker Compose setup were not attempted within the assessment's timeframe — noted here honestly rather than presented as done.
